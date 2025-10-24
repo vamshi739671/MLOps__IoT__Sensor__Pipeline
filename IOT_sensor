@@ -1,0 +1,205 @@
+import argparse
+import os
+import glob
+import json
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+# -----------------------------
+# Helpers: data loading & preprocessing
+# -----------------------------
+
+def load_csvs(path_or_folder, timestamp_col=None, parse_dates=True):
+    """Load a single CSV or all CSVs in a folder and concat into one DataFrame."""
+    if os.path.isdir(path_or_folder):
+        files = sorted(glob.glob(os.path.join(path_or_folder, "*.csv")))
+        if not files:
+            raise FileNotFoundError(f"No CSV files found in {path_or_folder}")
+        dfs = [pd.read_csv(f, low_memory=False) for f in files]
+        df = pd.concat(dfs, ignore_index=True)
+    elif os.path.isfile(path_or_folder):
+        df = pd.read_csv(path_or_folder, low_memory=False)
+    else:
+        raise FileNotFoundError(path_or_folder)
+
+    if timestamp_col is None:
+        candidates = [c for c in df.columns if 'time' in c.lower() or 'date' in c.lower()]
+        timestamp_col = candidates[0] if candidates else df.columns[0]
+
+    if parse_dates:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors='coerce')
+
+    df = df.set_index(timestamp_col).sort_index()
+    return df
+
+
+def preprocess(df, feature_cols=None, resample_rule='1S', fill_method='ffill'):
+    if feature_cols is None:
+        feature_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    else:
+        feature_cols = [c for c in feature_cols if c in df.columns]
+
+    df_num = df[feature_cols].copy()
+
+    try:
+        df_res = df_num.resample(resample_rule).mean()
+    except Exception:
+        df_res = df_num
+
+    if fill_method == 'ffill':
+        df_res = df_res.fillna(method='ffill').fillna(method='bfill')
+    elif fill_method == 'interpolate':
+        df_res = df_res.interpolate().fillna(method='bfill')
+    else:
+        df_res = df_res.fillna(0)
+
+    df_res = df_res.dropna(how='all')
+    return df_res
+
+# -----------------------------
+# Sequence creation for time-series models
+# -----------------------------
+
+def create_sequences(values, seq_len=60, stride=1):
+    T, D = values.shape
+    if T < seq_len:
+        raise ValueError("Time series too short for the chosen sequence length")
+    num_seq = 1 + (T - seq_len) // stride
+    seqs = np.zeros((num_seq, seq_len, D), dtype=np.float32)
+    for i in range(num_seq):
+        start = i * stride
+        seqs[i] = values[start:start+seq_len]
+    return seqs
+
+# -----------------------------
+# LSTM Autoencoder model
+# -----------------------------
+
+def build_lstm_autoencoder(input_shape, latent_dim=16):
+    seq_len, n_feats = input_shape
+    inp = layers.Input(shape=(seq_len, n_feats))
+    x = layers.LSTM(128, return_sequences=True)(inp)
+    x = layers.LSTM(64, return_sequences=False)(x)
+    bottleneck = layers.Dense(latent_dim, activation='relu')(x)
+
+    x = layers.RepeatVector(seq_len)(bottleneck)
+    x = layers.LSTM(64, return_sequences=True)(x)
+    x = layers.LSTM(128, return_sequences=True)(x)
+    out = layers.TimeDistributed(layers.Dense(n_feats))(x)
+
+    model = models.Model(inputs=inp, outputs=out)
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# -----------------------------
+# Training + thresholding
+# -----------------------------
+
+def train_autoencoder(train_seqs, val_seqs, epochs=10, batch_size=64, out_dir='./output'):
+    input_shape = train_seqs.shape[1:]
+    model = build_lstm_autoencoder(input_shape)
+
+    os.makedirs(out_dir, exist_ok=True)
+    checkpoint = callbacks.ModelCheckpoint(os.path.join(out_dir, 'best_model.h5'), save_best_only=True, monitor='val_loss')
+    early = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+    history = model.fit(
+        train_seqs, train_seqs,
+        validation_data=(val_seqs, val_seqs),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[checkpoint, early],
+        verbose=1
+    )
+
+    val_pred = model.predict(val_seqs)
+    val_mse = np.mean(np.mean(np.square(val_seqs - val_pred), axis=2), axis=1)
+    threshold = float(np.mean(val_mse) + 3 * np.std(val_mse))
+
+    model.save(os.path.join(out_dir, 'final_model.h5'))
+    with open(os.path.join(out_dir, 'threshold.json'), 'w') as f:
+        json.dump({'threshold': threshold}, f)
+
+    return model, threshold, history
+
+# -----------------------------
+# Streaming simulation
+# -----------------------------
+
+def stream_simulator(df, scaler, model, threshold, seq_len=60, step=1, pause=None):
+    values = df.values
+    index = df.index
+    T = len(df)
+    for end in range(seq_len, T+1, step):
+        window = values[end-seq_len:end]
+        window_scaled = scaler.transform(window)
+        window_scaled = window_scaled.reshape((1, seq_len, window_scaled.shape[1]))
+        pred = model.predict(window_scaled, verbose=0)
+        mse = float(np.mean(np.mean(np.square(window_scaled - pred), axis=2), axis=1))
+        is_anom = mse > threshold
+        timestamp = index[end-1]
+        yield timestamp, bool(is_anom), mse, df.iloc[end-seq_len:end]
+
+# -----------------------------
+# CLI / main
+# -----------------------------
+
+def main(args):
+    print('\n[1] Loading data...')
+    df_raw = load_csvs(args.data)
+    print(f'    Loaded dataframe with shape: {df_raw.shape}')
+
+    print('\n[2] Preprocessing...')
+    processed = preprocess(df_raw, feature_cols=None, resample_rule=args.resample)
+    print(f'    Processed shape: {processed.shape}')
+
+    n = len(processed)
+    train_end = int(n * 0.6)
+    val_end = int(n * 0.8)
+
+    train_df = processed.iloc[:train_end]
+    val_df = processed.iloc[train_end:val_end]
+    test_df = processed.iloc[val_end:]
+
+    scaler = StandardScaler()
+    scaler.fit(train_df.values)
+    joblib.dump(scaler, os.path.join(args.output, 'scaler.joblib'))
+
+    print('\n[3] Creating sequences...')
+    train_seqs = create_sequences(scaler.transform(train_df.values), seq_len=args.seq_len, stride=args.stride)
+    val_seqs = create_sequences(scaler.transform(val_df.values), seq_len=args.seq_len, stride=args.stride)
+
+    print(f'    Train sequences: {train_seqs.shape}, Val sequences: {val_seqs.shape}')
+
+    print('\n[4] Training model...')
+    model, threshold, history = train_autoencoder(train_seqs, val_seqs, epochs=args.epochs, batch_size=args.batch_size, out_dir=args.output)
+    print(f'    Threshold set to: {threshold:.6f}')
+
+    print('\n[5] Simulating streaming inference on test set...')
+    for timestamp, is_anom, mse, _ in stream_simulator(test_df, scaler, model, threshold, seq_len=args.seq_len, step=args.step):
+        status = '[ALERT]' if is_anom else '[OK]'
+        print(f'{status} {timestamp} — recon_error={mse:.6f}')
+
+    print('\nDone. Model, scaler, and threshold saved to', args.output)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='IoT realtime anomaly detection pipeline (LSTM Autoencoder)')
+    parser.add_argument('--data', required=True, help='CSV file or folder containing CSVs (time indexed or with time column)')
+    parser.add_argument('--output', default='./output', help='Directory to save model and artifacts')
+    parser.add_argument('--seq_len', type=int, default=60, help='Sequence length (timesteps per sample)')
+    parser.add_argument('--stride', type=int, default=1, help='Stride to create overlapping sequences')
+    parser.add_argument('--resample', default='1S', help='Pandas resample rule (e.g., 1S, 1T)')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--step', type=int, default=1, help='Streaming step size (timesteps to move forward per inference)')
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+    main(args)
